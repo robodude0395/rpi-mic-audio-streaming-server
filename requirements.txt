@@ -1,2 +1,3 @@
 pyalsaaudio
 sounddevice
+numpy
