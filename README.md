@@ -4,6 +4,33 @@ Lightweight UDP audio streaming for Linux/ALSA. Captures microphone audio on a c
 
 Two files, no classes, minimal dependencies. The server receives raw PCM over UDP and writes it to ALSA. A browser-based test page is built in for quick verification.
 
+## Quickstart — Web Test Interface
+
+The fastest way to try it out. Stream audio from your phone or laptop browser to the Pi's speaker, no client install needed.
+
+```bash
+# On the Pi
+sudo apt-get install libasound2-dev
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Start the server with the web interface
+python3 -c "
+import audio_server
+audio_server.start()
+audio_server.start_web()
+print('Open http://<pi-ip>:8080 in your browser')
+import time
+try:
+    while True: time.sleep(1)
+except KeyboardInterrupt:
+    audio_server.stop_web()
+    audio_server.stop()
+"
+```
+
+Then open `http://<your-pi-ip>:8080` on your phone or laptop, click Start, and speak into the mic. Audio plays through the Pi's speaker. Ctrl+C on the Pi to stop.
+
 ## Installation
 
 Requires Python 3.7+.
@@ -11,19 +38,15 @@ Requires Python 3.7+.
 **Server** (Linux only — needs ALSA headers):
 
 ```bash
-pip install pyalsaaudio
+sudo apt-get install libasound2-dev
+pip install -r requirements.txt
 ```
 
-On Debian/Ubuntu you may need the ALSA dev package first:
+Or install individually:
 
 ```bash
 sudo apt-get install libasound2-dev
 pip install pyalsaaudio
-```
-
-**Client** (cross-platform):
-
-```bash
 pip install sounddevice
 ```
 
