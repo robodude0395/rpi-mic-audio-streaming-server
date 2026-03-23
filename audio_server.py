@@ -649,8 +649,11 @@ def start_web(http_port: int = 8080, ws_port: int = 4001) -> None:
     _ws_thread = threading.Thread(target=_ws_loop, args=(ws_port,), daemon=True)
     _ws_thread.start()
 
-    # Start HTTP server
-    _http_server = HTTPServer(("0.0.0.0", http_port), _TestPageHandler)
+    # Start HTTP server (allow_reuse_address must be set before bind)
+    class _ReusableHTTPServer(HTTPServer):
+        allow_reuse_address = True
+
+    _http_server = _ReusableHTTPServer(("0.0.0.0", http_port), _TestPageHandler)
     _http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
     _http_thread.start()
 
