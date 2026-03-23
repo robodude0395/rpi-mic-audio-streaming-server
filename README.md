@@ -110,6 +110,26 @@ audio_server.stop()
 
 The test page captures your browser's microphone via `getUserMedia`, encodes it as raw PCM, and sends it over WebSocket to the server.
 
+### Browser Microphone Permission (HTTPS Requirement)
+
+Chrome (and most browsers) only allow microphone access on secure origins. When accessing the Pi over the local network via plain HTTP, `navigator.mediaDevices` will be `undefined` and the Start button won't work.
+
+To fix this, add the Pi's address to Chrome's insecure origins allowlist:
+
+1. Open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`
+2. Paste `http://<pi-ip>:8080` (e.g. `http://192.168.0.55:8080`)
+3. Set the dropdown to **Enabled**
+4. Click **Relaunch**
+
+Alternatively, launch Chrome from the command line (macOS):
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --unsafely-treat-insecure-origin-as-secure="http://<pi-ip>:8080"
+```
+
+This is only needed for LAN access over HTTP. `localhost` works without it.
+
 ## Configurable Parameters
 
 ### Server (`audio_server.start()`)

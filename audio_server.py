@@ -227,7 +227,12 @@ def _run_ws_server(host: str, port: int) -> None:
 
     async def _serve():
         global _ws_server
-        _ws_server = await websockets.server.serve(_ws_handler, host, port)
+        _ws_server = await websockets.server.serve(
+            _ws_handler, host, port,
+            compression=None,           # disable permessage-deflate (huge on Pi Zero)
+            max_size=2**16,             # 64 KB max frame — plenty for audio chunks
+            ping_interval=None,         # no keepalive pings needed on LAN
+        )
         _logger.info("WebSocket server listening on port %d", port)
         await _ws_server.wait_closed()
 
@@ -334,7 +339,7 @@ button:disabled { background: #555; cursor: not-allowed; }
         stream = s;
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         source = audioCtx.createMediaStreamSource(stream);
-        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        processor = audioCtx.createScriptProcessor(512, 1, 1);
         processor.onaudioprocess = function(e) {
           if (!running || !ws || ws.readyState !== WebSocket.OPEN) return;
           var pcm = floatToInt16(downsample(e.inputBuffer.getChannelData(0), audioCtx.sampleRate, TARGET_RATE));
