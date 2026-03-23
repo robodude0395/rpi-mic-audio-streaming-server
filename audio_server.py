@@ -200,13 +200,16 @@ def _recv_loop() -> None:
 
 
 async def _ws_handler(websocket):
-    """Handle a single WebSocket client — receive binary audio and buffer it."""
+    """Handle a single WebSocket client — receive binary audio and play via ALSA."""
     addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
     try:
         async for message in websocket:
-            if isinstance(message, bytes) and len(message) > 0:
-                buffer_write(message)
+            if isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None:
+                try:
+                    _alsa_dev.write(message)
+                except Exception:
+                    _logger.exception("Error writing WebSocket audio to ALSA")
     except Exception:
         pass
     finally:
