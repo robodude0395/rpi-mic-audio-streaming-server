@@ -70,10 +70,6 @@ _session_timeout: float = 5.0
 
 _logger = logging.getLogger(__name__)
 
-# WebSocket state
-_ws_sock: "socket.socket | None" = None
-_ws_thread: "threading.Thread | None" = None
-
 # HTTP server state
 _http_server: "HTTPServer | None" = None
 _http_thread: "threading.Thread | None" = None
@@ -213,88 +209,11 @@ def _recv_loop() -> None:
 _WS_MAGIC = b"258EAFA5-E914-47DA-95CA-5AB5AA786C88"
 
 
-def _ws_handshake(conn: socket.socket) -> bool:
-    """Perform the HTTP upgrade handshake. Return True on success.
-
-    Returns any leftover bytes after the HTTP headers via module-level
-    ``_ws_handshake_leftover`` so the frame reader can use them.
-    """
-    global _ws_handshake_leftover
-    _ws_handshake_leftover = b""
-
-    try:
-        raw = conn.recv(4096)
-    except OSError as e:
-        _logger.warning("WS handshake recv error: %s", e)
-        return False
-
-    if not raw:
-        _logger.warning("WS handshake: empty request")
-        return False
-
-    request_str = raw.decode("utf-8", errors="replace")
-    _logger.debug("WS handshake request:\n%s", request_str)
-
-    # Split headers from any trailing data
-    header_end = raw.find(b"\r\n\r\n")
-    if header_end == -1:
-        _logger.warning("WS handshake: no header terminator found")
-        return False
-
-    header_bytes = raw[:header_end]
-    _ws_handshake_leftover = raw[header_end + 4:]
-    if _ws_handshake_leftover:
-        _logger.debug("WS handshake: %d leftover bytes after headers", len(_ws_handshake_leftover))
-
-    request = header_bytes.decode("utf-8", errors="replace")
-    key = None
-    for line in request.split("\r\n"):
-        if line.lower().startswith("sec-websocket-key:"):
-            key = line.split(":", 1)[1].strip()
-            break
-
-    if key is None:
-        _logger.warning("WS handshake: no Sec-WebSocket-Key found")
-        return False
-
-    accept = base64.b64encode(
-        hashlib.sha1(key.encode() + _WS_MAGIC).digest()
-    ).decode()
-
-    response = (
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Accept: {accept}\r\n"
-        "\r\n"
-    )
-    try:
-        conn.sendall(response.encode())
-    except OSError as e:
-        _logger.warning("WS handshake send error: %s", e)
-        return False
-
-    _logger.debug("WS handshake completed, accept=%s", accept)
-    return True
-
-_ws_handshake_leftover: bytes = b""
-
-
-def _ws_read_frame(conn: socket.socket) -> "bytes | None":
-    """Read a single WebSocket frame and return the payload, or None on close/error."""
-    global _ws_handshake_leftover
-
-    _leftover_buf = bytearray(_ws_handshake_leftover)
-    _ws_handshake_leftover = b""
+def _ws_read_frame(conn) -> "bytes | None":
+    """Read a single WebSocket frame from a socket or file-like object."""
 
     def _recv_exact(n: int) -> bytes:
-        nonlocal _leftover_buf
         buf = bytearray()
-        # Use leftover bytes first
-        if _leftover_buf:
-            take = min(n, len(_leftover_buf))
-            buf.extend(_leftover_buf[:take])
-            _leftover_buf = _leftover_buf[take:]
         while len(buf) < n:
             chunk = conn.recv(n - len(buf))
             if not chunk:
@@ -305,24 +224,12 @@ def _ws_read_frame(conn: socket.socket) -> "bytes | None":
     try:
         hdr = _recv_exact(2)
     except socket.timeout:
-        raise  # let caller handle timeouts
-    except (OSError, ConnectionError) as e:
-        _logger.debug("WS frame read error getting header: %s", e)
+        raise
+    except (OSError, ConnectionError):
         return None
 
-    _logger.debug("WS frame header bytes: %s (hex: %s)", hdr, hdr.hex())
     opcode = hdr[0] & 0x0F
-    fin = bool(hdr[0] & 0x80)
-    rsv1 = bool(hdr[0] & 0x40)
-    _logger.debug("WS frame: fin=%s rsv1=%s opcode=%d", fin, rsv1, opcode)
-
-    if opcode == 0x8:  # close frame
-        _logger.debug("WS received close frame")
-        return None
-
-    # If RSV1 is set, the client is using permessage-deflate which we don't support
-    if rsv1:
-        _logger.warning("WS frame has RSV1 set (compressed) — not supported, closing")
+    if opcode == 0x8:
         return None
 
     masked = bool(hdr[1] & 0x80)
@@ -344,64 +251,6 @@ def _ws_read_frame(conn: socket.socket) -> "bytes | None":
             payload[i] ^= mask_key[i % 4]
 
     return bytes(payload)
-
-
-def _ws_loop(port: int = 4001) -> None:
-    """Accept WebSocket connections, read binary frames, feed into buffer_write().
-
-    Runs in a daemon thread. Single client at a time.
-    """
-    global _ws_sock
-
-    _ws_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _ws_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    _ws_sock.bind(("0.0.0.0", port))
-    _ws_sock.listen(1)
-    _ws_sock.settimeout(1.0)
-
-    _logger.info("WebSocket server listening on port %d", port)
-
-    while _running:
-        # Accept a new connection
-        try:
-            conn, addr = _ws_sock.accept()
-        except socket.timeout:
-            continue
-        except OSError:
-            if not _running:
-                break
-            _logger.exception("WebSocket accept error")
-            continue
-
-        _logger.info("WebSocket client connected from %s", addr)
-
-        # Disable Nagle's algorithm so handshake response is sent immediately
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        if not _ws_handshake(conn):
-            _logger.warning("WebSocket handshake failed for %s", addr)
-            conn.close()
-            continue
-
-        # Read frames until close or error
-        conn.settimeout(5.0)
-        while _running:
-            try:
-                payload = _ws_read_frame(conn)
-            except socket.timeout:
-                continue  # no data yet, keep waiting
-            if payload is None:
-                _logger.info("WS frame read returned None — closing connection")
-                break
-            if len(payload) > 0:
-                _logger.debug("WS received %d bytes", len(payload))
-                buffer_write(payload)
-
-        try:
-            conn.close()
-        except OSError:
-            pass
-        _logger.info("WebSocket client disconnected")
 
 
 # ---------------------------------------------------------------------------
@@ -501,8 +350,7 @@ button:disabled { background: #555; cursor: not-allowed; }
   };
 
   function startStream() {
-    var wsHost = location.hostname || "localhost";
-    var wsUrl = "ws://" + wsHost + ":" + WS_PORT;
+    var wsUrl = "ws://" + location.host + "/ws";
 
     ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
@@ -576,12 +424,18 @@ button:disabled { background: #555; cursor: not-allowed; }
 
 
 class _TestPageHandler(BaseHTTPRequestHandler):
-    """Serve the inline test page for any GET request."""
+    """Serve the test page and handle WebSocket upgrades on the same port."""
 
     def do_GET(self):
+        # Check for WebSocket upgrade
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            self._handle_websocket()
+            return
+
+        # Serve the HTML test page
         page = _TEST_PAGE_HTML
         page = page.replace("{{UDP_PORT}}", str(_test_page_vars.get("udp_port", 4000)))
-        page = page.replace("{{WS_PORT}}", str(_test_page_vars.get("ws_port", 4001)))
+        page = page.replace("{{WS_PORT}}", str(_test_page_vars.get("ws_port", 8080)))
         page = page.replace("{{SAMPLE_RATE}}", str(_test_page_vars.get("sample_rate", 16000)))
         page = page.replace("{{CHUNK_SIZE}}", str(_test_page_vars.get("chunk_size", 1024)))
         body = page.encode("utf-8")
@@ -591,8 +445,48 @@ class _TestPageHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_websocket(self):
+        """Upgrade the HTTP connection to WebSocket and read audio frames."""
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self.send_error(400, "Missing Sec-WebSocket-Key")
+            return
+
+        accept = base64.b64encode(
+            hashlib.sha1(key.encode() + _WS_MAGIC).digest()
+        ).decode()
+
+        # Send 101 response directly on the raw socket
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        )
+        self.wfile.write(response.encode())
+        self.wfile.flush()
+
+        _logger.info("WebSocket upgraded from %s", self.client_address)
+
+        # Now read WebSocket frames from the raw socket
+        raw_sock = self.request
+        raw_sock.settimeout(5.0)
+
+        while _running:
+            try:
+                payload = _ws_read_frame(raw_sock)
+            except socket.timeout:
+                continue
+            if payload is None:
+                break
+            if len(payload) > 0:
+                buffer_write(payload)
+
+        _logger.info("WebSocket client disconnected from %s", self.client_address)
+
     def log_message(self, format, *args):
-        pass  # Suppress default request logging
+        pass
 
 
 # Template variable store (set by start_web)
@@ -689,21 +583,19 @@ def is_running() -> bool:
 def start_web(http_port: int = 8080, ws_port: int = 4001) -> None:
     """Start HTTP server for test page and WebSocket receiver.
 
+    WebSocket is handled on the same port as HTTP (upgrade on /ws path).
+    The *ws_port* parameter is kept for API compatibility but ignored.
     Call after :func:`start` so that the playback pipeline is ready.
     """
-    global _http_server, _http_thread, _ws_thread, _test_page_vars
+    global _http_server, _http_thread, _test_page_vars
 
     # Populate template variables from current config
     _test_page_vars = {
         "udp_port": _sock.getsockname()[1] if _sock else 4000,
-        "ws_port": ws_port,
+        "ws_port": http_port,  # same port now
         "sample_rate": _sample_rate,
         "chunk_size": _chunk_size,
     }
-
-    # Start WebSocket thread
-    _ws_thread = threading.Thread(target=_ws_loop, args=(ws_port,), daemon=True)
-    _ws_thread.start()
 
     # Start HTTP server (allow_reuse_address must be set before bind)
     class _ReusableHTTPServer(HTTPServer):
@@ -713,24 +605,12 @@ def start_web(http_port: int = 8080, ws_port: int = 4001) -> None:
     _http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
     _http_thread.start()
 
-    _logger.info(
-        "Web test page at http://0.0.0.0:%d  (WebSocket on port %d)",
-        http_port,
-        ws_port,
-    )
+    _logger.info("Web test page at http://0.0.0.0:%d", http_port)
 
 
 def stop_web() -> None:
-    """Stop HTTP and WebSocket servers."""
-    global _http_server, _http_thread, _ws_sock, _ws_thread
-
-    # Close WebSocket socket first to unblock accept() in _ws_loop
-    if _ws_sock is not None:
-        try:
-            _ws_sock.close()
-        except OSError:
-            pass
-        _ws_sock = None
+    """Stop HTTP server."""
+    global _http_server, _http_thread
 
     if _http_server is not None:
         _http_server.shutdown()
@@ -740,8 +620,4 @@ def stop_web() -> None:
         _http_thread.join(timeout=2.0)
         _http_thread = None
 
-    if _ws_thread is not None:
-        _ws_thread.join(timeout=2.0)
-        _ws_thread = None
-
-    _logger.info("Web servers stopped")
+    _logger.info("Web server stopped")
