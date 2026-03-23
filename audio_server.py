@@ -579,6 +579,7 @@ def start(
 
     # Bind UDP socket
     _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     _sock.bind(("0.0.0.0", port))
     _sock.settimeout(0.5)
 
