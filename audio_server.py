@@ -306,7 +306,8 @@ def _ws_read_frame(conn: socket.socket) -> "bytes | None":
         hdr = _recv_exact(2)
     except socket.timeout:
         raise  # let caller handle timeouts
-    except (OSError, ConnectionError):
+    except (OSError, ConnectionError) as e:
+        _logger.debug("WS frame read error getting header: %s", e)
         return None
 
     _logger.debug("WS frame header bytes: %s (hex: %s)", hdr, hdr.hex())
@@ -373,6 +374,9 @@ def _ws_loop(port: int = 4001) -> None:
             continue
 
         _logger.info("WebSocket client connected from %s", addr)
+
+        # Disable Nagle's algorithm so handshake response is sent immediately
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         if not _ws_handshake(conn):
             _logger.warning("WebSocket handshake failed for %s", addr)
