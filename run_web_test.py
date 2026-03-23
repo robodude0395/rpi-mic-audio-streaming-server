@@ -1,10 +1,12 @@
 """Quick-start script: launches the audio server with the web test interface."""
 
 import logging
+import os
+import signal
 import time
 import audio_server
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(name)s %(message)s")
 
 audio_server.start()
 audio_server.start_web()
@@ -19,3 +21,5 @@ except KeyboardInterrupt:
     print("\nShutting down...")
     audio_server.stop_web()
     audio_server.stop()
+    # Force exit — don't wait for daemon threads stuck on blocking I/O
+    os._exit(0)

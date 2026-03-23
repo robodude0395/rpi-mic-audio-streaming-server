@@ -217,13 +217,17 @@ def _ws_handshake(conn: socket.socket) -> bool:
     """Perform the HTTP upgrade handshake. Return True on success."""
     try:
         raw = conn.recv(4096)
-    except OSError:
+    except OSError as e:
+        _logger.warning("WS handshake recv error: %s", e)
         return False
 
     if not raw:
+        _logger.warning("WS handshake: empty request")
         return False
 
     request = raw.decode("utf-8", errors="replace")
+    _logger.debug("WS handshake request:\n%s", request)
+
     key = None
     for line in request.split("\r\n"):
         if line.lower().startswith("sec-websocket-key:"):
@@ -231,6 +235,7 @@ def _ws_handshake(conn: socket.socket) -> bool:
             break
 
     if key is None:
+        _logger.warning("WS handshake: no Sec-WebSocket-Key found")
         return False
 
     accept = base64.b64encode(
@@ -246,9 +251,11 @@ def _ws_handshake(conn: socket.socket) -> bool:
     )
     try:
         conn.sendall(response.encode())
-    except OSError:
+    except OSError as e:
+        _logger.warning("WS handshake send error: %s", e)
         return False
 
+    _logger.debug("WS handshake completed, accept=%s", accept)
     return True
 
 
@@ -338,8 +345,10 @@ def _ws_loop(port: int = 4001) -> None:
             except socket.timeout:
                 continue  # no data yet, keep waiting
             if payload is None:
+                _logger.info("WS frame read returned None — closing connection")
                 break
             if len(payload) > 0:
+                _logger.debug("WS received %d bytes", len(payload))
                 buffer_write(payload)
 
         try:
@@ -602,6 +611,14 @@ def stop() -> None:
 
     _running = False
 
+    # Close socket first to unblock the recv() call in _recv_loop
+    if _sock is not None:
+        try:
+            _sock.close()
+        except Exception:
+            _logger.exception("Error closing socket")
+        _sock = None
+
     if _thread is not None:
         _thread.join(timeout=1.0)
         _thread = None
@@ -612,13 +629,6 @@ def stop() -> None:
         except Exception:
             _logger.exception("Error closing ALSA device")
         _alsa_dev = None
-
-    if _sock is not None:
-        try:
-            _sock.close()
-        except Exception:
-            _logger.exception("Error closing socket")
-        _sock = None
 
     _last_seq = -1
 
@@ -668,6 +678,14 @@ def stop_web() -> None:
     """Stop HTTP and WebSocket servers."""
     global _http_server, _http_thread, _ws_sock, _ws_thread
 
+    # Close WebSocket socket first to unblock accept() in _ws_loop
+    if _ws_sock is not None:
+        try:
+            _ws_sock.close()
+        except OSError:
+            pass
+        _ws_sock = None
+
     if _http_server is not None:
         _http_server.shutdown()
         _http_server = None
@@ -675,13 +693,6 @@ def stop_web() -> None:
     if _http_thread is not None:
         _http_thread.join(timeout=2.0)
         _http_thread = None
-
-    if _ws_sock is not None:
-        try:
-            _ws_sock.close()
-        except OSError:
-            pass
-        _ws_sock = None
 
     if _ws_thread is not None:
         _ws_thread.join(timeout=2.0)
