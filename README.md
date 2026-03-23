@@ -4,6 +4,12 @@ Lightweight UDP audio streaming for Linux/ALSA. Captures microphone audio on a c
 
 Two files, no classes, minimal dependencies. The server receives raw PCM over UDP and writes it to ALSA. A browser-based test page is built in for quick verification.
 
+## System Architecture
+
+![System Architecture](diagrams/rpi_audio_streaming_system.png)
+
+The editable diagram is at [`diagrams/rpi_audio_streaming_system.drawio`](diagrams/rpi_audio_streaming_system.drawio) (open with [draw.io](https://app.diagrams.net)).
+
 ## Quickstart — Web Test Interface
 
 The fastest way to try it out. Stream audio from your phone or laptop browser to the Pi's speaker, no client install needed.

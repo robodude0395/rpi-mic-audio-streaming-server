@@ -1,0 +1,71 @@
+<mxfile host="app.diagrams.net" modified="2026-03-23" agent="Kiro" version="24.0">
+  <diagram name="System Architecture" id="rpi-audio-stream">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Browser Client -->
+        <mxCell id="10" value="Browser&#xa;(Laptop / Phone)" style="shape=mxgraph.cisco.computers_and_peripherals.laptop;sketch=0;fillColor=#e94560;fontColor=#e0e0e0;strokeColor=#c73650;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="200" width="120" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Python Client -->
+        <mxCell id="11" value="Python Client&#xa;audio_client.py" style="shape=mxgraph.cisco.computers_and_peripherals.laptop;sketch=0;fillColor=#e94560;fontColor=#e0e0e0;strokeColor=#c73650;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="500" width="120" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Raspberry Pi Cluster -->
+        <mxCell id="20" value="Raspberry Pi Zero" style="rounded=1;whiteSpace=wrap;fillColor=#16213e;strokeColor=#e94560;fontColor=#e94560;fontSize=14;fontStyle=1;verticalAlign=top;spacingTop=8;arcSize=12;" vertex="1" parent="1">
+          <mxGeometry x="350" y="120" width="500" height="500" as="geometry" />
+        </mxCell>
+
+        <!-- HTTP Server -->
+        <mxCell id="30" value="HTTP Server&#xa;:8080&#xa;(Test Page)" style="rounded=1;whiteSpace=wrap;fillColor=#0f3460;strokeColor=#e94560;fontColor=#e0e0e0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="180" width="140" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- WebSocket Server -->
+        <mxCell id="31" value="WebSocket Server&#xa;:4001&#xa;(websockets lib)" style="rounded=1;whiteSpace=wrap;fillColor=#0f3460;strokeColor=#e94560;fontColor=#e0e0e0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="320" width="140" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- UDP Listener -->
+        <mxCell id="32" value="UDP Listener&#xa;:4000&#xa;(circular buffer)" style="rounded=1;whiteSpace=wrap;fillColor=#0f3460;strokeColor=#e94560;fontColor=#e0e0e0;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="470" width="140" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ALSA Playback -->
+        <mxCell id="33" value="ALSA Playback&#xa;(Speaker)" style="rounded=1;whiteSpace=wrap;fillColor=#533483;strokeColor=#6bff6b;fontColor=#e0e0e0;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="680" y="350" width="130" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Edge: Browser -> HTTP (dashed, HTML page) -->
+        <mxCell id="40" value="HTTP GET&#xa;(HTML page)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#888888;fontColor=#888888;fontSize=10;dashed=1;" edge="1" source="10" target="30" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Edge: Browser -> WebSocket (WS PCM audio) -->
+        <mxCell id="41" value="WS binary&#xa;PCM audio" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#e94560;fontColor=#e94560;fontSize=10;strokeWidth=2;" edge="1" source="10" target="31" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Edge: WebSocket -> ALSA (direct write) -->
+        <mxCell id="42" value="direct write" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#6bff6b;fontColor=#6bff6b;fontSize=10;strokeWidth=2;" edge="1" source="31" target="33" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Edge: Python Client -> UDP -->
+        <mxCell id="43" value="UDP packets&#xa;(seq + PCM)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#e94560;fontColor=#e94560;fontSize=10;strokeWidth=2;" edge="1" source="11" target="32" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Edge: UDP -> ALSA (buffer -> read -> write) -->
+        <mxCell id="44" value="buffer → read → write" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#6bff6b;fontColor=#6bff6b;fontSize=10;strokeWidth=2;" edge="1" source="32" target="33" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
