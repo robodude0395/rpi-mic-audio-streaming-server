@@ -8,7 +8,7 @@ import audio_server
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
-audio_server.start()
+audio_server.start(chunk_size=512)
 audio_server.start_web()
 
 print("Web test page running — open http://<pi-ip>:8080 in your browser")

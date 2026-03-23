@@ -200,19 +200,56 @@ def _recv_loop() -> None:
 
 
 async def _ws_handler(websocket):
-    """Handle a single WebSocket client — receive binary audio and play via ALSA."""
+    """Handle a single WebSocket client — receive binary audio and play via ALSA.
+
+    Uses a small asyncio.Queue as a jitter buffer.  A writer task drains
+    the queue and calls the blocking ALSA write in a thread-pool executor
+    so the receive loop is never stalled.  If audio arrives faster than
+    playback can consume it the queue is drained to the most recent
+    frame, preventing unbounded latency growth.
+    """
     addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
-    try:
-        async for message in websocket:
-            if isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None:
+
+    # Small queue — holds at most a few frames.  Older frames are
+    # discarded when the queue is full so latency stays bounded.
+    q: asyncio.Queue = asyncio.Queue(maxsize=2)
+    loop = asyncio.get_event_loop()
+
+    async def _writer():
+        while True:
+            data = await q.get()
+            if data is None:
+                break
+            if _alsa_dev is not None:
                 try:
-                    _alsa_dev.write(message)
+                    await loop.run_in_executor(None, _alsa_dev.write, data)
                 except Exception:
                     _logger.exception("Error writing WebSocket audio to ALSA")
+
+    writer_task = asyncio.ensure_future(_writer())
+
+    try:
+        async for message in websocket:
+            if not isinstance(message, bytes) or len(message) == 0:
+                continue
+            # If the queue is full, drop all queued frames and push only
+            # the latest one — this keeps latency from growing.
+            if q.full():
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+            try:
+                q.put_nowait(message)
+            except asyncio.QueueFull:
+                pass  # drop frame
     except Exception:
         pass
     finally:
+        await q.put(None)  # signal writer to exit
+        await writer_task
         _logger.info("WebSocket client disconnected from %s", addr)
 
 
@@ -424,7 +461,7 @@ def start(
 
     _alsa_dev = alsaaudio.PCM(
         type=alsaaudio.PCM_PLAYBACK,
-        mode=alsaaudio.PCM_NORMAL,
+        mode=alsaaudio.PCM_NONBLOCK,
         device=alsa_device,
     )
     _alsa_dev.setchannels(1)
