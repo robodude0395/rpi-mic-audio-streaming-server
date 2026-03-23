@@ -1,7 +1,6 @@
 """Lightweight UDP audio streaming server for Linux/ALSA playback."""
 
-import base64
-import hashlib
+import asyncio
 import logging
 import struct
 import socket
@@ -75,6 +74,11 @@ _logger = logging.getLogger(__name__)
 _http_server: "HTTPServer | None" = None
 _http_thread: "threading.Thread | None" = None
 
+# WebSocket server state (asyncio-based via websockets library)
+_ws_loop: "asyncio.AbstractEventLoop | None" = None
+_ws_server = None
+_ws_thread: "threading.Thread | None" = None
+
 # ---------------------------------------------------------------------------
 # Circular buffer
 # ---------------------------------------------------------------------------
@@ -91,7 +95,6 @@ def buffer_write(data: bytes) -> None:
     if _buf_count == _buf_capacity:
         # Buffer full — advance read index to drop oldest
         _buf_read_idx = (_buf_read_idx + 1) % _buf_capacity
-
     else:
         _buf_count += 1
 
@@ -127,7 +130,6 @@ def buffer_count() -> int:
     return _buf_count
 
 
-
 # ---------------------------------------------------------------------------
 # Receive loop (runs in dedicated thread)
 # ---------------------------------------------------------------------------
@@ -136,28 +138,22 @@ _SILENCE_TIMEOUT = 0.2  # seconds of empty buffer before writing silence
 
 
 def _recv_loop() -> None:
-    """Receive UDP datagrams, parse, order-check, buffer, and play via ALSA.
-
-    Designed to run in a daemon thread started by :func:`start`.
-    """
+    """Receive UDP datagrams, parse, order-check, buffer, and play via ALSA."""
     global _last_seq, _last_packet_time, _running
 
-    last_buffer_empty_time: float = 0.0  # tracks when buffer first became empty
+    last_buffer_empty_time: float = 0.0
 
     while _running:
-        # -- receive --------------------------------------------------------
         try:
             data = _sock.recv(4 + _chunk_size + 64)
         except socket.timeout:
             now = time.time()
-            # Session timeout: no packets for 5 s while a session was active
             if now - _last_packet_time > _session_timeout and _last_seq >= 0:
                 _logger.info("Session timeout — no packets for %.1fs, resetting", _session_timeout)
                 _last_seq = -1
                 buffer_clear()
                 last_buffer_empty_time = 0.0
 
-            # Silence: buffer empty for >200 ms → write silence to ALSA
             if _alsa_dev is not None and buffer_count() == 0:
                 if last_buffer_empty_time == 0.0:
                     last_buffer_empty_time = now
@@ -173,7 +169,6 @@ def _recv_loop() -> None:
             _logger.exception("Socket error in recv loop")
             continue
 
-        # -- parse & order --------------------------------------------------
         try:
             seq, payload = unpack_chunk(data)
         except ValueError:
@@ -181,20 +176,16 @@ def _recv_loop() -> None:
             continue
 
         if not should_accept(seq, _last_seq):
-            continue  # out-of-order / duplicate
+            continue
 
-        # New session detection (first packet after timeout reset)
         if _last_seq == -1:
             _logger.info("New session started (seq=%d)", seq)
 
         _last_seq = seq
         _last_packet_time = time.time()
         buffer_write(payload)
-
-        # Reset empty-buffer timer since we just got data
         last_buffer_empty_time = 0.0
 
-        # -- playback -------------------------------------------------------
         chunk = buffer_read()
         if chunk and _alsa_dev is not None:
             try:
@@ -204,54 +195,40 @@ def _recv_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket handler (runs in dedicated thread)
+# WebSocket handler (uses `websockets` library via asyncio)
 # ---------------------------------------------------------------------------
 
-_WS_MAGIC = b"258EAFA5-E914-47DA-95CA-5AB5AA786C88"
 
-
-def _ws_read_frame(conn) -> "bytes | None":
-    """Read a single WebSocket frame from a socket or file-like object."""
-
-    def _recv_exact(n: int) -> bytes:
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = conn.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("connection closed")
-            buf.extend(chunk)
-        return bytes(buf)
-
+async def _ws_handler(websocket):
+    """Handle a single WebSocket client — receive binary audio and buffer it."""
+    addr = websocket.remote_address
+    _logger.info("WebSocket client connected from %s", addr)
     try:
-        hdr = _recv_exact(2)
-    except socket.timeout:
-        raise
-    except (OSError, ConnectionError):
-        return None
+        async for message in websocket:
+            if isinstance(message, bytes) and len(message) > 0:
+                buffer_write(message)
+    except Exception:
+        pass
+    finally:
+        _logger.info("WebSocket client disconnected from %s", addr)
 
-    opcode = hdr[0] & 0x0F
-    if opcode == 0x8:
-        return None
 
-    masked = bool(hdr[1] & 0x80)
-    length = hdr[1] & 0x7F
+def _run_ws_server(host: str, port: int) -> None:
+    """Entry point for the WebSocket server thread."""
+    global _ws_loop, _ws_server
 
-    try:
-        if length == 126:
-            length = struct.unpack(">H", _recv_exact(2))[0]
-        elif length == 127:
-            length = struct.unpack(">Q", _recv_exact(8))[0]
+    import websockets.server
 
-        mask_key = _recv_exact(4) if masked else b""
-        payload = bytearray(_recv_exact(length))
-    except (OSError, ConnectionError):
-        return None
+    _ws_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_ws_loop)
 
-    if masked:
-        for i in range(len(payload)):
-            payload[i] ^= mask_key[i % 4]
+    async def _serve():
+        global _ws_server
+        _ws_server = await websockets.server.serve(_ws_handler, host, port)
+        _logger.info("WebSocket server listening on port %d", port)
+        await _ws_server.wait_closed()
 
-    return bytes(payload)
+    _ws_loop.run_until_complete(_serve())
 
 
 # ---------------------------------------------------------------------------
@@ -301,16 +278,11 @@ button:disabled { background: #555; cursor: not-allowed; }
 </div>
 <script>
 (function() {
-  var ws = null;
-  var audioCtx = null;
-  var stream = null;
-  var processor = null;
-  var source = null;
+  var ws = null, audioCtx = null, stream = null, processor = null, source = null;
   var running = false;
   var WS_PORT = {{WS_PORT}};
   var TARGET_RATE = {{SAMPLE_RATE}};
   var CHUNK_SIZE = {{CHUNK_SIZE}};
-
   var btn = document.getElementById("btn");
   var statusEl = document.getElementById("status");
 
@@ -324,11 +296,10 @@ button:disabled { background: #555; cursor: not-allowed; }
     }
   }
 
-  function floatToInt16(float32arr) {
-    var len = float32arr.length;
-    var buf = new Int16Array(len);
-    for (var i = 0; i < len; i++) {
-      var s = Math.max(-1, Math.min(1, float32arr[i]));
+  function floatToInt16(f) {
+    var buf = new Int16Array(f.length);
+    for (var i = 0; i < f.length; i++) {
+      var s = Math.max(-1, Math.min(1, f[i]));
       buf[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
     return buf;
@@ -339,39 +310,19 @@ button:disabled { background: #555; cursor: not-allowed; }
     var ratio = fromRate / toRate;
     var newLen = Math.round(buffer.length / ratio);
     var result = new Float32Array(newLen);
-    for (var i = 0; i < newLen; i++) {
-      var idx = Math.floor(i * ratio);
-      result[i] = buffer[idx];
-    }
+    for (var i = 0; i < newLen; i++) result[i] = buffer[Math.floor(i * ratio)];
     return result;
   }
 
-  window.toggle = function() {
-    if (running) { stopStream(); } else { startStream(); }
-  };
+  window.toggle = function() { running ? stopStream() : startStream(); };
 
   function startStream() {
-    var wsUrl = "ws://" + location.host + "/ws";
-
+    var wsUrl = "ws://" + location.hostname + ":" + WS_PORT;
     ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
-
-    ws.onopen = function() {
-      setStatus(true);
-      btn.textContent = "Stop";
-      running = true;
-      startMic();
-    };
-
-    ws.onclose = function() {
-      setStatus(false);
-      if (running) stopStream();
-    };
-
-    ws.onerror = function() {
-      setStatus(false);
-      if (running) stopStream();
-    };
+    ws.onopen = function() { setStatus(true); btn.textContent = "Stop"; running = true; startMic(); };
+    ws.onclose = function() { setStatus(false); if (running) stopStream(); };
+    ws.onerror = function() { setStatus(false); if (running) stopStream(); };
   }
 
   function startMic() {
@@ -380,15 +331,10 @@ button:disabled { background: #555; cursor: not-allowed; }
         stream = s;
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         source = audioCtx.createMediaStreamSource(stream);
-        var bufSize = 4096;
-        processor = audioCtx.createScriptProcessor(bufSize, 1, 1);
-
+        processor = audioCtx.createScriptProcessor(4096, 1, 1);
         processor.onaudioprocess = function(e) {
           if (!running || !ws || ws.readyState !== WebSocket.OPEN) return;
-          var input = e.inputBuffer.getChannelData(0);
-          var resampled = downsample(input, audioCtx.sampleRate, TARGET_RATE);
-          var pcm = floatToInt16(resampled);
-          // Send in chunks matching server chunk_size (bytes), each sample is 2 bytes
+          var pcm = floatToInt16(downsample(e.inputBuffer.getChannelData(0), audioCtx.sampleRate, TARGET_RATE));
           var samplesPerChunk = CHUNK_SIZE / 2;
           for (var off = 0; off < pcm.length; off += samplesPerChunk) {
             var end = Math.min(off + samplesPerChunk, pcm.length);
@@ -396,20 +342,14 @@ button:disabled { background: #555; cursor: not-allowed; }
             ws.send(slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength));
           }
         };
-
         source.connect(processor);
         processor.connect(audioCtx.destination);
       })
-      .catch(function(err) {
-        alert("Microphone access denied: " + err.message);
-        stopStream();
-      });
+      .catch(function(err) { alert("Microphone access denied: " + err.message); stopStream(); });
   }
 
   function stopStream() {
-    running = false;
-    btn.textContent = "Start";
-
+    running = false; btn.textContent = "Start";
     if (processor) { try { processor.disconnect(); } catch(e){} processor = null; }
     if (source) { try { source.disconnect(); } catch(e){} source = null; }
     if (audioCtx) { try { audioCtx.close(); } catch(e){} audioCtx = null; }
@@ -425,22 +365,12 @@ button:disabled { background: #555; cursor: not-allowed; }
 
 
 class _TestPageHandler(BaseHTTPRequestHandler):
-    """Serve the test page and handle WebSocket upgrades on the same port."""
+    """Serve the HTML test page only — WebSocket is on a separate port."""
 
     def do_GET(self):
-        _logger.debug("HTTP GET %s from %s (Upgrade: %s)",
-                       self.path, self.client_address,
-                       self.headers.get("Upgrade", "none"))
-
-        # Check for WebSocket upgrade
-        if self.headers.get("Upgrade", "").lower() == "websocket":
-            self._handle_websocket()
-            return
-
-        # Serve the HTML test page
         page = _TEST_PAGE_HTML
         page = page.replace("{{UDP_PORT}}", str(_test_page_vars.get("udp_port", 4000)))
-        page = page.replace("{{WS_PORT}}", str(_test_page_vars.get("ws_port", 8080)))
+        page = page.replace("{{WS_PORT}}", str(_test_page_vars.get("ws_port", 4001)))
         page = page.replace("{{SAMPLE_RATE}}", str(_test_page_vars.get("sample_rate", 16000)))
         page = page.replace("{{CHUNK_SIZE}}", str(_test_page_vars.get("chunk_size", 1024)))
         body = page.encode("utf-8")
@@ -449,46 +379,6 @@ class _TestPageHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-
-    def _handle_websocket(self):
-        """Upgrade the HTTP connection to WebSocket and read audio frames."""
-        key = self.headers.get("Sec-WebSocket-Key")
-        if not key:
-            self.send_error(400, "Missing Sec-WebSocket-Key")
-            return
-
-        accept = base64.b64encode(
-            hashlib.sha1(key.encode() + _WS_MAGIC).digest()
-        ).decode()
-
-        # Send 101 response directly on the raw socket
-        response = (
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {accept}\r\n"
-            "\r\n"
-        )
-        self.wfile.write(response.encode())
-        self.wfile.flush()
-
-        _logger.info("WebSocket upgraded from %s", self.client_address)
-
-        # Now read WebSocket frames from the raw socket
-        raw_sock = self.request
-        raw_sock.settimeout(5.0)
-
-        while _running:
-            try:
-                payload = _ws_read_frame(raw_sock)
-            except socket.timeout:
-                continue
-            if payload is None:
-                break
-            if len(payload) > 0:
-                buffer_write(payload)
-
-        _logger.info("WebSocket client disconnected from %s", self.client_address)
 
     def log_message(self, format, *args):
         pass
@@ -517,13 +407,11 @@ def start(
     if _running:
         raise RuntimeError("Server is already running")
 
-    # Apply config
     _chunk_size = chunk_size
     _sample_rate = sample_rate
     _buf_capacity = buffer_chunks
     _session_timeout = 5.0
 
-    # Open ALSA device (lazy import — not available on all systems)
     import alsaaudio
 
     _alsa_dev = alsaaudio.PCM(
@@ -536,13 +424,11 @@ def start(
     _alsa_dev.setformat(alsaaudio.PCM_FORMAT_S16_LE)
     _alsa_dev.setperiodsize(chunk_size // 2)
 
-    # Bind UDP socket
     _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     _sock.bind(("0.0.0.0", port))
     _sock.settimeout(0.5)
 
-    # Start receiver thread
     _running = True
     _thread = threading.Thread(target=_recv_loop, daemon=True)
     _thread.start()
@@ -551,12 +437,11 @@ def start(
 
 
 def stop() -> None:
-    """Stop receiver thread, close ALSA device and socket. Returns within 1s."""
+    """Stop receiver thread, close ALSA device and socket."""
     global _running, _thread, _alsa_dev, _sock, _last_seq
 
     _running = False
 
-    # Close socket first to unblock the recv() call in _recv_loop
     if _sock is not None:
         try:
             _sock.close()
@@ -576,7 +461,6 @@ def stop() -> None:
         _alsa_dev = None
 
     _last_seq = -1
-
     _logger.info("Audio server stopped")
 
 
@@ -586,23 +470,21 @@ def is_running() -> bool:
 
 
 def start_web(http_port: int = 8080, ws_port: int = 4001) -> None:
-    """Start HTTP server for test page and WebSocket receiver.
+    """Start HTTP server for test page and websockets server for audio."""
+    global _http_server, _http_thread, _ws_thread, _test_page_vars
 
-    WebSocket is handled on the same port as HTTP (upgrade on /ws path).
-    The *ws_port* parameter is kept for API compatibility but ignored.
-    Call after :func:`start` so that the playback pipeline is ready.
-    """
-    global _http_server, _http_thread, _test_page_vars
-
-    # Populate template variables from current config
     _test_page_vars = {
         "udp_port": _sock.getsockname()[1] if _sock else 4000,
-        "ws_port": http_port,  # same port now
+        "ws_port": ws_port,
         "sample_rate": _sample_rate,
         "chunk_size": _chunk_size,
     }
 
-    # Start HTTP server — threaded so WebSocket connections don't block page loads
+    # Start websockets server in its own thread with its own event loop
+    _ws_thread = threading.Thread(target=_run_ws_server, args=("0.0.0.0", ws_port), daemon=True)
+    _ws_thread.start()
+
+    # Start HTTP server
     class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         allow_reuse_address = True
         daemon_threads = True
@@ -611,12 +493,25 @@ def start_web(http_port: int = 8080, ws_port: int = 4001) -> None:
     _http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
     _http_thread.start()
 
-    _logger.info("Web test page at http://0.0.0.0:%d", http_port)
+    _logger.info("Web test page at http://0.0.0.0:%d  (WebSocket on port %d)", http_port, ws_port)
 
 
 def stop_web() -> None:
-    """Stop HTTP server."""
-    global _http_server, _http_thread
+    """Stop HTTP and WebSocket servers."""
+    global _http_server, _http_thread, _ws_server, _ws_loop, _ws_thread
+
+    if _ws_server is not None and _ws_loop is not None:
+        _ws_loop.call_soon_threadsafe(_ws_server.close)
+
+    if _ws_loop is not None:
+        _ws_loop.call_soon_threadsafe(_ws_loop.stop)
+
+    if _ws_thread is not None:
+        _ws_thread.join(timeout=2.0)
+        _ws_thread = None
+
+    _ws_server = None
+    _ws_loop = None
 
     if _http_server is not None:
         _http_server.shutdown()
