@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -427,6 +428,10 @@ class _TestPageHandler(BaseHTTPRequestHandler):
     """Serve the test page and handle WebSocket upgrades on the same port."""
 
     def do_GET(self):
+        _logger.debug("HTTP GET %s from %s (Upgrade: %s)",
+                       self.path, self.client_address,
+                       self.headers.get("Upgrade", "none"))
+
         # Check for WebSocket upgrade
         if self.headers.get("Upgrade", "").lower() == "websocket":
             self._handle_websocket()
@@ -597,11 +602,12 @@ def start_web(http_port: int = 8080, ws_port: int = 4001) -> None:
         "chunk_size": _chunk_size,
     }
 
-    # Start HTTP server (allow_reuse_address must be set before bind)
-    class _ReusableHTTPServer(HTTPServer):
+    # Start HTTP server — threaded so WebSocket connections don't block page loads
+    class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         allow_reuse_address = True
+        daemon_threads = True
 
-    _http_server = _ReusableHTTPServer(("0.0.0.0", http_port), _TestPageHandler)
+    _http_server = _ThreadedHTTPServer(("0.0.0.0", http_port), _TestPageHandler)
     _http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
     _http_thread.start()
 
