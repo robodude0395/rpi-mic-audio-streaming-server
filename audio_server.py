@@ -266,6 +266,8 @@ def _ws_read_frame(conn: socket.socket) -> "bytes | None":
 
     try:
         hdr = _recv_exact(2)
+    except socket.timeout:
+        raise  # let caller handle timeouts
     except (OSError, ConnectionError):
         return None
 
@@ -329,9 +331,12 @@ def _ws_loop(port: int = 4001) -> None:
             continue
 
         # Read frames until close or error
-        conn.settimeout(1.0)
+        conn.settimeout(5.0)
         while _running:
-            payload = _ws_read_frame(conn)
+            try:
+                payload = _ws_read_frame(conn)
+            except socket.timeout:
+                continue  # no data yet, keep waiting
             if payload is None:
                 break
             if len(payload) > 0:
