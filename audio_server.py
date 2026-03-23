@@ -214,7 +214,14 @@ _WS_MAGIC = b"258EAFA5-E914-47DA-95CA-5AB5AA786C88"
 
 
 def _ws_handshake(conn: socket.socket) -> bool:
-    """Perform the HTTP upgrade handshake. Return True on success."""
+    """Perform the HTTP upgrade handshake. Return True on success.
+
+    Returns any leftover bytes after the HTTP headers via module-level
+    ``_ws_handshake_leftover`` so the frame reader can use them.
+    """
+    global _ws_handshake_leftover
+    _ws_handshake_leftover = b""
+
     try:
         raw = conn.recv(4096)
     except OSError as e:
@@ -225,9 +232,21 @@ def _ws_handshake(conn: socket.socket) -> bool:
         _logger.warning("WS handshake: empty request")
         return False
 
-    request = raw.decode("utf-8", errors="replace")
-    _logger.debug("WS handshake request:\n%s", request)
+    request_str = raw.decode("utf-8", errors="replace")
+    _logger.debug("WS handshake request:\n%s", request_str)
 
+    # Split headers from any trailing data
+    header_end = raw.find(b"\r\n\r\n")
+    if header_end == -1:
+        _logger.warning("WS handshake: no header terminator found")
+        return False
+
+    header_bytes = raw[:header_end]
+    _ws_handshake_leftover = raw[header_end + 4:]
+    if _ws_handshake_leftover:
+        _logger.debug("WS handshake: %d leftover bytes after headers", len(_ws_handshake_leftover))
+
+    request = header_bytes.decode("utf-8", errors="replace")
     key = None
     for line in request.split("\r\n"):
         if line.lower().startswith("sec-websocket-key:"):
@@ -258,12 +277,24 @@ def _ws_handshake(conn: socket.socket) -> bool:
     _logger.debug("WS handshake completed, accept=%s", accept)
     return True
 
+_ws_handshake_leftover: bytes = b""
+
 
 def _ws_read_frame(conn: socket.socket) -> "bytes | None":
     """Read a single WebSocket frame and return the payload, or None on close/error."""
+    global _ws_handshake_leftover
+
+    _leftover_buf = bytearray(_ws_handshake_leftover)
+    _ws_handshake_leftover = b""
 
     def _recv_exact(n: int) -> bytes:
+        nonlocal _leftover_buf
         buf = bytearray()
+        # Use leftover bytes first
+        if _leftover_buf:
+            take = min(n, len(_leftover_buf))
+            buf.extend(_leftover_buf[:take])
+            _leftover_buf = _leftover_buf[take:]
         while len(buf) < n:
             chunk = conn.recv(n - len(buf))
             if not chunk:
@@ -278,8 +309,19 @@ def _ws_read_frame(conn: socket.socket) -> "bytes | None":
     except (OSError, ConnectionError):
         return None
 
+    _logger.debug("WS frame header bytes: %s (hex: %s)", hdr, hdr.hex())
     opcode = hdr[0] & 0x0F
+    fin = bool(hdr[0] & 0x80)
+    rsv1 = bool(hdr[0] & 0x40)
+    _logger.debug("WS frame: fin=%s rsv1=%s opcode=%d", fin, rsv1, opcode)
+
     if opcode == 0x8:  # close frame
+        _logger.debug("WS received close frame")
+        return None
+
+    # If RSV1 is set, the client is using permessage-deflate which we don't support
+    if rsv1:
+        _logger.warning("WS frame has RSV1 set (compressed) — not supported, closing")
         return None
 
     masked = bool(hdr[1] & 0x80)
