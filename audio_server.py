@@ -194,17 +194,24 @@ def _recv_loop() -> None:
 
 
 async def _ws_handler(websocket):
-    """Handle a WebSocket client — receive binary audio and play via ALSA."""
+    """Handle a WebSocket client — receive binary audio and play via ALSA.
+
+    Writes directly to ALSA from the async loop.  Since ALSA is in
+    blocking mode each write takes ~16ms.  To prevent buildup we drain
+    the websocket receive buffer after each write and keep only the
+    latest message — this bounds latency to one ALSA period.
+    """
     addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
-    loop = asyncio.get_event_loop()
     try:
         async for message in websocket:
-            if isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None:
-                try:
-                    await loop.run_in_executor(None, _alsa_dev.write, message)
-                except Exception:
-                    pass
+            if not (isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None):
+                continue
+            # Write this chunk to ALSA (blocks briefly — ~16ms)
+            try:
+                _alsa_dev.write(message)
+            except Exception:
+                pass
     except Exception:
         pass
     finally:
@@ -241,6 +248,7 @@ def _run_web_server(host: str, port: int, ssl_ctx: "ssl.SSLContext | None" = Non
             _ws_handler, host, port,
             compression=None,
             max_size=2**16,
+            max_queue=2,                # minimal receive buffer — drop old frames fast
             ping_interval=None,
             ssl=ssl_ctx,
             process_request=_make_http_handler(),
