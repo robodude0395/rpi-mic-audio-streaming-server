@@ -6,11 +6,8 @@ import os
 import ssl
 import struct
 import socket
-import tempfile
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -73,11 +70,7 @@ _session_timeout: float = 5.0
 
 _logger = logging.getLogger(__name__)
 
-# HTTP server state
-_http_server: "HTTPServer | None" = None
-_http_thread: "threading.Thread | None" = None
-
-# WebSocket server state (asyncio-based via websockets library)
+# Web server state (single websockets server handles both HTTP and WS)
 _ws_loop: "asyncio.AbstractEventLoop | None" = None
 _ws_server = None
 _ws_thread: "threading.Thread | None" = None
@@ -91,12 +84,10 @@ def buffer_write(data: bytes) -> None:
     """Write *data* to the circular buffer, overwriting the oldest chunk if full."""
     global _buf, _buf_write_idx, _buf_read_idx, _buf_count
 
-    # Lazily initialise the fixed-size list on first write
     if len(_buf) < _buf_capacity:
         _buf = [b""] * _buf_capacity
 
     if _buf_count == _buf_capacity:
-        # Buffer full — advance read index to drop oldest
         _buf_read_idx = (_buf_read_idx + 1) % _buf_capacity
     else:
         _buf_count += 1
@@ -137,7 +128,7 @@ def buffer_count() -> int:
 # Receive loop (runs in dedicated thread)
 # ---------------------------------------------------------------------------
 
-_SILENCE_TIMEOUT = 0.2  # seconds of empty buffer before writing silence
+_SILENCE_TIMEOUT = 0.2
 
 
 def _recv_loop() -> None:
@@ -198,12 +189,12 @@ def _recv_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket handler (uses `websockets` library via asyncio)
+# WebSocket + HTTP handler (single port via websockets library)
 # ---------------------------------------------------------------------------
 
 
 async def _ws_handler(websocket):
-    """Handle a single WebSocket client — receive binary audio and play via ALSA."""
+    """Handle a WebSocket client — receive binary audio and play via ALSA."""
     addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
     loop = asyncio.get_event_loop()
@@ -220,32 +211,49 @@ async def _ws_handler(websocket):
         _logger.info("WebSocket client disconnected from %s", addr)
 
 
-def _run_ws_server(host: str, port: int, ssl_ctx: "ssl.SSLContext | None" = None) -> None:
-    """Entry point for the WebSocket server thread."""
+def _make_http_handler():
+    """Return a process_request handler that serves the HTML page for non-WS requests."""
+
+    def handler(connection, request):
+        # If it's a WebSocket upgrade, return None to let websockets handle it
+        if "Upgrade" in request.headers:
+            return None
+        # Serve the HTML test page as plain text response, then fix content-type
+        resp = connection.respond(200, _build_test_page())
+        resp.headers["Content-Type"] = "text/html; charset=utf-8"
+        return resp
+
+    return handler
+
+
+def _run_web_server(host: str, port: int, ssl_ctx: "ssl.SSLContext | None" = None) -> None:
+    """Entry point for the combined HTTP+WS server thread."""
     global _ws_loop, _ws_server
 
-    import websockets.server
+    import websockets.asyncio.server
 
     _ws_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_ws_loop)
 
     async def _serve():
         global _ws_server
-        _ws_server = await websockets.server.serve(
+        _ws_server = await websockets.asyncio.server.serve(
             _ws_handler, host, port,
             compression=None,
             max_size=2**16,
             ping_interval=None,
             ssl=ssl_ctx,
+            process_request=_make_http_handler(),
         )
-        _logger.info("WebSocket server listening on port %d%s", port, " (wss)" if ssl_ctx else "")
-        await _ws_server.wait_closed()
+        proto = "wss" if ssl_ctx else "ws"
+        _logger.info("Web server listening on %s://0.0.0.0:%d", proto, port)
+        await _ws_server.serve_forever()
 
     _ws_loop.run_until_complete(_serve())
 
 
 # ---------------------------------------------------------------------------
-# HTTP test page
+# HTML test page template
 # ---------------------------------------------------------------------------
 
 _TEST_PAGE_HTML = """\
@@ -285,7 +293,6 @@ button:disabled { background: #555; cursor: not-allowed; }
   <br><br>
   <button id="btn" onclick="toggle()">Start</button>
   <div class="info">
-    UDP port: <strong>{{UDP_PORT}}</strong> &middot; WS port: <strong>{{WS_PORT}}</strong><br>
     Sample rate: {{SAMPLE_RATE}} Hz &middot; Chunk: {{CHUNK_SIZE}} B
   </div>
 </div>
@@ -293,20 +300,16 @@ button:disabled { background: #555; cursor: not-allowed; }
 (function() {
   var ws = null, audioCtx = null, stream = null, processor = null, source = null;
   var running = false;
-  var WS_PORT = {{WS_PORT}};
   var TARGET_RATE = {{SAMPLE_RATE}};
   var CHUNK_SIZE = {{CHUNK_SIZE}};
   var btn = document.getElementById("btn");
   var statusEl = document.getElementById("status");
 
   function setStatus(connected) {
-    if (connected) {
-      statusEl.className = "status connected";
-      statusEl.innerHTML = '<span class="dot"></span>Connected';
-    } else {
-      statusEl.className = "status disconnected";
-      statusEl.innerHTML = '<span class="dot"></span>Disconnected';
-    }
+    statusEl.className = connected ? "status connected" : "status disconnected";
+    statusEl.innerHTML = connected
+      ? '<span class="dot"></span>Connected'
+      : '<span class="dot"></span>Disconnected';
   }
 
   function floatToInt16(f) {
@@ -330,8 +333,9 @@ button:disabled { background: #555; cursor: not-allowed; }
   window.toggle = function() { running ? stopStream() : startStream(); };
 
   function startStream() {
+    // Same host and port — WS upgrade on the same HTTPS connection
     var wsProto = (location.protocol === "https:") ? "wss://" : "ws://";
-    var wsUrl = wsProto + location.hostname + ":" + WS_PORT;
+    var wsUrl = wsProto + location.host;
     ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     ws.onopen = function() { setStatus(true); btn.textContent = "Stop"; running = true; startMic(); };
@@ -372,28 +376,22 @@ button:disabled { background: #555; cursor: not-allowed; }
 </html>
 """
 
-
-class _TestPageHandler(BaseHTTPRequestHandler):
-    """Serve the HTML test page only — WebSocket is on a separate port."""
-
-    def do_GET(self):
-        page = _TEST_PAGE_HTML
-        page = page.replace("{{UDP_PORT}}", str(_test_page_vars.get("udp_port", 4000)))
-        page = page.replace("{{WS_PORT}}", str(_test_page_vars.get("ws_port", 4001)))
-        page = page.replace("{{SAMPLE_RATE}}", str(_test_page_vars.get("sample_rate", 16000)))
-        page = page.replace("{{CHUNK_SIZE}}", str(_test_page_vars.get("chunk_size", 1024)))
-        body = page.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):
-        pass
+# Template variable store
+_test_page_vars: dict = {}
 
 
-# Cert directory for self-signed TLS
+def _build_test_page() -> str:
+    """Return the HTML test page with template variables filled in."""
+    page = _TEST_PAGE_HTML
+    page = page.replace("{{SAMPLE_RATE}}", str(_test_page_vars.get("sample_rate", 16000)))
+    page = page.replace("{{CHUNK_SIZE}}", str(_test_page_vars.get("chunk_size", 1024)))
+    return page
+
+
+# ---------------------------------------------------------------------------
+# Self-signed TLS certificate
+# ---------------------------------------------------------------------------
+
 _CERT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".certs")
 
 
@@ -406,8 +404,7 @@ def _ensure_self_signed_cert() -> tuple:
     if os.path.exists(certfile) and os.path.exists(keyfile):
         return certfile, keyfile
 
-    _logger.info("Generating self-signed TLS certificate...")
-    # Use openssl CLI — available on Raspbian by default, no extra pip deps
+    _logger.info("Generating self-signed TLS certificate (may take a moment on Pi Zero)...")
     import subprocess
     subprocess.run([
         "openssl", "req", "-x509", "-newkey", "rsa:2048",
@@ -417,10 +414,6 @@ def _ensure_self_signed_cert() -> tuple:
     ], check=True, capture_output=True)
     _logger.info("TLS certificate saved to %s", _CERT_DIR)
     return certfile, keyfile
-
-
-# Template variable store (set by start_web)
-_test_page_vars: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -457,7 +450,7 @@ def start(
     _alsa_dev.setchannels(1)
     _alsa_dev.setrate(sample_rate)
     _alsa_dev.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-    _alsa_dev.setperiodsize(256)  # ~16ms at 16kHz
+    _alsa_dev.setperiodsize(256)
 
     _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -504,55 +497,39 @@ def is_running() -> bool:
     return _running
 
 
-def start_web(http_port: int = 8080, ws_port: int = 4001) -> None:
-    """Start HTTPS server for test page and secure WebSocket server for audio.
+def start_web(port: int = 8080) -> None:
+    """Start HTTPS server that serves the test page and handles WebSocket audio.
 
-    Uses a self-signed certificate so browsers allow getUserMedia without
-    special flags.  On first visit you'll see a browser security warning —
-    click through it once and the mic permission prompt works normally.
+    Everything runs on a single port — the websockets library serves the
+    HTML page for normal GET requests and upgrades to WebSocket for audio.
+    Uses a self-signed TLS certificate so browsers allow getUserMedia.
     """
-    global _http_server, _http_thread, _ws_thread, _test_page_vars
+    global _ws_thread, _test_page_vars
 
-    # Generate or reuse self-signed cert
     certfile, keyfile = _ensure_self_signed_cert()
 
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain(certfile, keyfile)
 
-    # SSL context for websockets (same cert)
-    ws_ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ws_ssl_ctx.load_cert_chain(certfile, keyfile)
-
     _test_page_vars = {
-        "udp_port": _sock.getsockname()[1] if _sock else 4000,
-        "ws_port": ws_port,
         "sample_rate": _sample_rate,
         "chunk_size": _chunk_size,
     }
 
-    # Start secure websockets server
-    _ws_thread = threading.Thread(target=_run_ws_server, args=("0.0.0.0", ws_port, ws_ssl_ctx), daemon=True)
+    _ws_thread = threading.Thread(
+        target=_run_web_server, args=("0.0.0.0", port, ssl_ctx), daemon=True
+    )
     _ws_thread.start()
 
-    # Start HTTPS server
-    class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-        allow_reuse_address = True
-        daemon_threads = True
-
-    _http_server = _ThreadedHTTPServer(("0.0.0.0", http_port), _TestPageHandler)
-    _http_server.socket = ssl_ctx.wrap_socket(_http_server.socket, server_side=True)
-    _http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
-    _http_thread.start()
-
-    _logger.info("Web test page at https://0.0.0.0:%d  (WebSocket on wss port %d)", http_port, ws_port)
+    _logger.info("Web test page at https://0.0.0.0:%d", port)
 
 
 def stop_web() -> None:
-    """Stop HTTP and WebSocket servers."""
-    global _http_server, _http_thread, _ws_server, _ws_loop, _ws_thread
+    """Stop the web server."""
+    global _ws_server, _ws_loop, _ws_thread
 
-    if _ws_server is not None and _ws_loop is not None:
-        _ws_loop.call_soon_threadsafe(_ws_server.close)
+    if _ws_server is not None:
+        _ws_server.close()
 
     if _ws_loop is not None:
         _ws_loop.call_soon_threadsafe(_ws_loop.stop)
@@ -563,13 +540,5 @@ def stop_web() -> None:
 
     _ws_server = None
     _ws_loop = None
-
-    if _http_server is not None:
-        _http_server.shutdown()
-        _http_server = None
-
-    if _http_thread is not None:
-        _http_thread.join(timeout=2.0)
-        _http_thread = None
 
     _logger.info("Web server stopped")

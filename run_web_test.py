@@ -2,7 +2,6 @@
 
 import logging
 import os
-import signal
 import time
 import audio_server
 
@@ -22,5 +21,4 @@ except KeyboardInterrupt:
     print("\nShutting down...")
     audio_server.stop_web()
     audio_server.stop()
-    # Force exit — don't wait for daemon threads stuck on blocking I/O
     os._exit(0)
