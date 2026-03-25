@@ -185,9 +185,13 @@ def _ws_recv_frame(sock):
 def _ws_client_loop(conn, addr):
     """Handle one WebSocket client — read frames, write directly to ALSA."""
     _logger.info("WebSocket client connected from %s", addr)
+    conn.settimeout(5.0)
     try:
         while _running:
-            payload = _ws_recv_frame(conn)
+            try:
+                payload = _ws_recv_frame(conn)
+            except socket.timeout:
+                continue
             if payload is None:
                 break
             if len(payload) > 0 and _alsa_dev is not None:
@@ -225,15 +229,15 @@ def _ws_accept_loop(host, port):
             break
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Read the HTTP upgrade request
+        # Read the HTTP upgrade request — careful not to over-read
         try:
             raw = b""
             while b"\r\n\r\n" not in raw:
-                chunk = conn.recv(4096)
-                if not chunk:
+                byte = conn.recv(1)
+                if not byte:
                     conn.close()
                     continue
-                raw += chunk
+                raw += byte
         except Exception:
             conn.close()
             continue
@@ -245,6 +249,7 @@ def _ws_accept_loop(host, port):
                 key = line.split(":", 1)[1].strip()
                 break
         if not key:
+            _logger.warning("No Sec-WebSocket-Key in request from %s", addr)
             conn.close()
             continue
 
