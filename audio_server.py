@@ -1,7 +1,5 @@
 """Lightweight UDP audio streaming server for Linux/ALSA playback."""
 
-import base64
-import hashlib
 import logging
 import struct
 import socket
@@ -58,7 +56,6 @@ _logger = logging.getLogger(__name__)
 
 _http_server = None
 _http_thread = None
-_ws_sock = None
 _ws_thread = None
 
 
@@ -133,140 +130,43 @@ def _recv_loop():
 
 
 # ---------------------------------------------------------------------------
-# WebSocket — minimal hand-rolled, runs in its own thread
+# WebSocket server — sync API from websockets lib, no asyncio
 # ---------------------------------------------------------------------------
 
-_WS_MAGIC = b"258EAFA5-E914-47DA-95CA-5AB5AA786C88"
+_ws_server_obj = None
 
 
-def _ws_accept_key(key):
-    return base64.b64encode(hashlib.sha1(key.encode() + _WS_MAGIC).digest()).decode()
-
-
-def _ws_recv_frame(sock):
-    """Read one WebSocket frame. Returns payload bytes or None on close/error."""
-    def _read(n):
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
-            if not chunk:
-                return None
-            buf.extend(chunk)
-        return bytes(buf)
-
-    hdr = _read(2)
-    if hdr is None:
-        return None
-    opcode = hdr[0] & 0x0F
-    if opcode == 0x8:  # close
-        return None
-    masked = bool(hdr[1] & 0x80)
-    length = hdr[1] & 0x7F
-    if length == 126:
-        ext = _read(2)
-        if ext is None:
-            return None
-        length = struct.unpack(">H", ext)[0]
-    elif length == 127:
-        ext = _read(8)
-        if ext is None:
-            return None
-        length = struct.unpack(">Q", ext)[0]
-    mask_key = _read(4) if masked else b""
-    if mask_key is None:
-        return None
-    payload = bytearray(_read(length) or b"")
-    if masked:
-        for i in range(len(payload)):
-            payload[i] ^= mask_key[i % 4]
-    return bytes(payload)
-
-
-def _ws_client_loop(conn, addr):
+def _ws_handler(websocket):
     """Handle one WebSocket client — read frames, write directly to ALSA."""
+    addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
-    conn.settimeout(5.0)
     try:
-        while _running:
-            try:
-                payload = _ws_recv_frame(conn)
-            except socket.timeout:
-                continue
-            if payload is None:
-                break
-            if len(payload) > 0 and _alsa_dev is not None:
+        for message in websocket:
+            if isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None:
                 try:
-                    _alsa_dev.write(payload)
+                    _alsa_dev.write(message)
                 except Exception:
                     pass
     except Exception:
         pass
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
         _logger.info("WebSocket client disconnected from %s", addr)
 
 
-def _ws_accept_loop(host, port):
-    """Accept WebSocket connections on a raw TCP socket. No TLS, no asyncio."""
-    global _ws_sock
-    _ws_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _ws_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    _ws_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    _ws_sock.bind((host, port))
-    _ws_sock.listen(2)
-    _ws_sock.settimeout(1.0)
-    _logger.info("WebSocket server on port %d", port)
+def _run_ws_server(host, port):
+    """Run the sync websockets server (blocking)."""
+    global _ws_server_obj
+    from websockets.sync.server import serve
 
-    while _running:
-        try:
-            conn, addr = _ws_sock.accept()
-        except socket.timeout:
-            continue
-        except OSError:
-            break
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        # Read the HTTP upgrade request — careful not to over-read
-        try:
-            raw = b""
-            while b"\r\n\r\n" not in raw:
-                byte = conn.recv(1)
-                if not byte:
-                    conn.close()
-                    continue
-                raw += byte
-        except Exception:
-            conn.close()
-            continue
-
-        # Extract Sec-WebSocket-Key
-        key = None
-        for line in raw.decode(errors="ignore").split("\r\n"):
-            if line.lower().startswith("sec-websocket-key:"):
-                key = line.split(":", 1)[1].strip()
-                break
-        if not key:
-            _logger.warning("No Sec-WebSocket-Key in request from %s", addr)
-            conn.close()
-            continue
-
-        # Send 101 upgrade
-        accept = _ws_accept_key(key)
-        resp = (
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {accept}\r\n"
-            "\r\n"
-        )
-        conn.sendall(resp.encode())
-
-        # Handle client in a new thread — direct ALSA write, zero buffering
-        t = threading.Thread(target=_ws_client_loop, args=(conn, addr), daemon=True)
-        t.start()
+    with serve(
+        _ws_handler, host, port,
+        compression=None,
+        ping_interval=None,
+        max_size=2**16,
+    ) as server:
+        _ws_server_obj = server
+        _logger.info("WebSocket server on port %d", port)
+        server.serve_forever()
 
 
 # ---------------------------------------------------------------------------
@@ -429,8 +329,8 @@ def start_web(http_port=8080, ws_port=4001):
     global _http_server, _http_thread, _ws_thread, _test_ws_port
     _test_ws_port = ws_port
 
-    # WebSocket accept loop — raw TCP, no TLS, no asyncio
-    _ws_thread = threading.Thread(target=_ws_accept_loop, args=("0.0.0.0", ws_port), daemon=True)
+    # WebSocket server — sync websockets lib, plain thread, no asyncio
+    _ws_thread = threading.Thread(target=_run_ws_server, args=("0.0.0.0", ws_port), daemon=True)
     _ws_thread.start()
 
     # HTTP server for the test page
@@ -444,11 +344,10 @@ def start_web(http_port=8080, ws_port=4001):
 
 
 def stop_web():
-    global _http_server, _http_thread, _ws_sock, _ws_thread
-    if _ws_sock:
-        try: _ws_sock.close()
-        except: pass
-        _ws_sock = None
+    global _http_server, _http_thread, _ws_server_obj, _ws_thread
+    if _ws_server_obj:
+        _ws_server_obj.shutdown()
+        _ws_server_obj = None
     if _ws_thread:
         _ws_thread.join(timeout=2.0)
         _ws_thread = None
