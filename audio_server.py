@@ -149,7 +149,7 @@ def _ws_handler(websocket):
     addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
 
-    period_bytes = 512  # 256 samples * 2 bytes (16-bit mono)
+    period_bytes = 256  # 128 samples * 2 bytes (16-bit mono)
     lock = threading.Lock()
     audio_buf = bytearray()
     has_data = threading.Event()
@@ -265,7 +265,7 @@ function mic(){
   navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false})
   .then(function(s){
     stream=s;ctx=new AudioContext();src=ctx.createMediaStreamSource(s);
-    proc=ctx.createScriptProcessor(256,1,1);
+    proc=ctx.createScriptProcessor(128,1,1);
     proc.onaudioprocess=function(e){
       if(!on||!ws||ws.readyState!==1)return;
       var pcm=f2i(ds(e.inputBuffer.getChannelData(0),ctx.sampleRate,R));
@@ -333,7 +333,7 @@ def start(port=4000, sample_rate=16000, chunk_size=1024, buffer_chunks=20, alsa_
     _alsa_dev.setchannels(1)
     _alsa_dev.setrate(sample_rate)
     _alsa_dev.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-    _alsa_dev.setperiodsize(256)
+    _alsa_dev.setperiodsize(128)  # 128 samples = 8ms at 16kHz
 
     _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

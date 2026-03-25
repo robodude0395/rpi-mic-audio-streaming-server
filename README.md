@@ -129,7 +129,7 @@ Or launch Chrome from the command line (macOS):
 
 ```bash
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --unsafely-treat-insecure-origin-as-secure="http://192.168.0.55:8080"
+  --unsafely-treat-insecure-origin-as-secure="http://<pi-ip>:8080"
 ```
 
 ## Configurable Parameters
