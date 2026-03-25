@@ -137,16 +137,28 @@ _ws_server_obj = None
 
 
 def _ws_handler(websocket):
-    """Handle one WebSocket client — read frames, write directly to ALSA."""
+    """Handle one WebSocket client — read frames, write directly to ALSA.
+
+    Drops frames when falling behind to prevent latency buildup.
+    """
     addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
+    last_write = 0.0
+    # Minimum interval between ALSA writes — matches period size.
+    # If frames arrive faster, we skip them to stay real-time.
+    min_interval = 0.012  # ~12ms
     try:
         for message in websocket:
-            if isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None:
-                try:
-                    _alsa_dev.write(message)
-                except Exception:
-                    _logger.exception("ALSA write error")
+            if not (isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None):
+                continue
+            now = time.time()
+            if now - last_write < min_interval:
+                continue  # drop — ALSA is still busy with the last write
+            try:
+                _alsa_dev.write(message)
+                last_write = time.time()
+            except Exception:
+                _logger.exception("ALSA write error")
     except Exception as e:
         _logger.error("WebSocket handler error from %s: %s", addr, e)
     finally:
