@@ -2,8 +2,11 @@
 
 import asyncio
 import logging
+import os
+import ssl
 import struct
 import socket
+import tempfile
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -200,44 +203,24 @@ def _recv_loop() -> None:
 
 
 async def _ws_handler(websocket):
-    """Handle a single WebSocket client — receive binary audio and play via ALSA.
-
-    ALSA write runs in a thread executor so it doesn't block the asyncio
-    loop.  We keep only the latest audio data — if a new message arrives
-    while the previous write is still pending, we replace it so latency
-    stays bounded.
-    """
+    """Handle a single WebSocket client — receive binary audio and play via ALSA."""
     addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
     loop = asyncio.get_event_loop()
-    latest = None  # most recent audio chunk
-    writing = False
-
-    async def _drain():
-        nonlocal latest, writing
-        while latest is not None:
-            data = latest
-            latest = None
-            writing = True
-            try:
-                await loop.run_in_executor(None, _alsa_dev.write, data)
-            except Exception:
-                pass
-            writing = False
-
     try:
         async for message in websocket:
             if isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None:
-                latest = message
-                if not writing:
-                    await _drain()
+                try:
+                    await loop.run_in_executor(None, _alsa_dev.write, message)
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
         _logger.info("WebSocket client disconnected from %s", addr)
 
 
-def _run_ws_server(host: str, port: int) -> None:
+def _run_ws_server(host: str, port: int, ssl_ctx: "ssl.SSLContext | None" = None) -> None:
     """Entry point for the WebSocket server thread."""
     global _ws_loop, _ws_server
 
@@ -250,11 +233,12 @@ def _run_ws_server(host: str, port: int) -> None:
         global _ws_server
         _ws_server = await websockets.server.serve(
             _ws_handler, host, port,
-            compression=None,           # disable permessage-deflate (huge on Pi Zero)
-            max_size=2**16,             # 64 KB max frame — plenty for audio chunks
-            ping_interval=None,         # no keepalive pings needed on LAN
+            compression=None,
+            max_size=2**16,
+            ping_interval=None,
+            ssl=ssl_ctx,
         )
-        _logger.info("WebSocket server listening on port %d", port)
+        _logger.info("WebSocket server listening on port %d%s", port, " (wss)" if ssl_ctx else "")
         await _ws_server.wait_closed()
 
     _ws_loop.run_until_complete(_serve())
@@ -346,7 +330,8 @@ button:disabled { background: #555; cursor: not-allowed; }
   window.toggle = function() { running ? stopStream() : startStream(); };
 
   function startStream() {
-    var wsUrl = "ws://" + location.hostname + ":" + WS_PORT;
+    var wsProto = (location.protocol === "https:") ? "wss://" : "ws://";
+    var wsUrl = wsProto + location.hostname + ":" + WS_PORT;
     ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     ws.onopen = function() { setStatus(true); btn.textContent = "Stop"; running = true; startMic(); };
@@ -406,6 +391,32 @@ class _TestPageHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass
+
+
+# Cert directory for self-signed TLS
+_CERT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".certs")
+
+
+def _ensure_self_signed_cert() -> tuple:
+    """Generate a self-signed cert+key if they don't exist. Returns (certfile, keyfile)."""
+    os.makedirs(_CERT_DIR, exist_ok=True)
+    certfile = os.path.join(_CERT_DIR, "cert.pem")
+    keyfile = os.path.join(_CERT_DIR, "key.pem")
+
+    if os.path.exists(certfile) and os.path.exists(keyfile):
+        return certfile, keyfile
+
+    _logger.info("Generating self-signed TLS certificate...")
+    # Use openssl CLI — available on Raspbian by default, no extra pip deps
+    import subprocess
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", keyfile, "-out", certfile,
+        "-days", "365", "-nodes",
+        "-subj", "/CN=rpi-audio-stream",
+    ], check=True, capture_output=True)
+    _logger.info("TLS certificate saved to %s", _CERT_DIR)
+    return certfile, keyfile
 
 
 # Template variable store (set by start_web)
@@ -494,8 +505,23 @@ def is_running() -> bool:
 
 
 def start_web(http_port: int = 8080, ws_port: int = 4001) -> None:
-    """Start HTTP server for test page and websockets server for audio."""
+    """Start HTTPS server for test page and secure WebSocket server for audio.
+
+    Uses a self-signed certificate so browsers allow getUserMedia without
+    special flags.  On first visit you'll see a browser security warning —
+    click through it once and the mic permission prompt works normally.
+    """
     global _http_server, _http_thread, _ws_thread, _test_page_vars
+
+    # Generate or reuse self-signed cert
+    certfile, keyfile = _ensure_self_signed_cert()
+
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(certfile, keyfile)
+
+    # SSL context for websockets (same cert)
+    ws_ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ws_ssl_ctx.load_cert_chain(certfile, keyfile)
 
     _test_page_vars = {
         "udp_port": _sock.getsockname()[1] if _sock else 4000,
@@ -504,20 +530,21 @@ def start_web(http_port: int = 8080, ws_port: int = 4001) -> None:
         "chunk_size": _chunk_size,
     }
 
-    # Start websockets server in its own thread with its own event loop
-    _ws_thread = threading.Thread(target=_run_ws_server, args=("0.0.0.0", ws_port), daemon=True)
+    # Start secure websockets server
+    _ws_thread = threading.Thread(target=_run_ws_server, args=("0.0.0.0", ws_port, ws_ssl_ctx), daemon=True)
     _ws_thread.start()
 
-    # Start HTTP server
+    # Start HTTPS server
     class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         allow_reuse_address = True
         daemon_threads = True
 
     _http_server = _ThreadedHTTPServer(("0.0.0.0", http_port), _TestPageHandler)
+    _http_server.socket = ssl_ctx.wrap_socket(_http_server.socket, server_side=True)
     _http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
     _http_thread.start()
 
-    _logger.info("Web test page at http://0.0.0.0:%d  (WebSocket on port %d)", http_port, ws_port)
+    _logger.info("Web test page at https://0.0.0.0:%d  (WebSocket on wss port %d)", http_port, ws_port)
 
 
 def stop_web() -> None:
