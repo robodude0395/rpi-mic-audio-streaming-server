@@ -262,7 +262,7 @@ function go(){
   ws.onerror=function(){ss(false);if(on)stop()};
 }
 function mic(){
-  navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false})
+  navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:true,autoGainControl:true},video:false})
   .then(function(s){
     stream=s;ctx=new AudioContext();src=ctx.createMediaStreamSource(s);
     proc=ctx.createScriptProcessor(256,1,1);
