@@ -202,21 +202,35 @@ def _recv_loop() -> None:
 async def _ws_handler(websocket):
     """Handle a single WebSocket client — receive binary audio and play via ALSA.
 
-    ALSA is in NONBLOCK mode so write() returns immediately.  We call it
-    directly from the asyncio receive loop — no queue, no executor, no
-    extra latency.  If ALSA's hardware buffer is momentarily full the
-    write returns a short count and we simply drop that chunk rather than
-    letting data pile up.
+    ALSA write runs in a thread executor so it doesn't block the asyncio
+    loop.  We keep only the latest audio data — if a new message arrives
+    while the previous write is still pending, we replace it so latency
+    stays bounded.
     """
     addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
+    loop = asyncio.get_event_loop()
+    latest = None  # most recent audio chunk
+    writing = False
+
+    async def _drain():
+        nonlocal latest, writing
+        while latest is not None:
+            data = latest
+            latest = None
+            writing = True
+            try:
+                await loop.run_in_executor(None, _alsa_dev.write, data)
+            except Exception:
+                pass
+            writing = False
+
     try:
         async for message in websocket:
             if isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None:
-                try:
-                    _alsa_dev.write(message)
-                except Exception:
-                    pass  # NONBLOCK may raise on overrun — just drop
+                latest = message
+                if not writing:
+                    await _drain()
     except Exception:
         pass
     finally:
@@ -426,13 +440,13 @@ def start(
 
     _alsa_dev = alsaaudio.PCM(
         type=alsaaudio.PCM_PLAYBACK,
-        mode=alsaaudio.PCM_NONBLOCK,
+        mode=alsaaudio.PCM_NORMAL,
         device=alsa_device,
     )
     _alsa_dev.setchannels(1)
     _alsa_dev.setrate(sample_rate)
     _alsa_dev.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-    _alsa_dev.setperiodsize(128)  # ~8ms at 16kHz — minimal ALSA latency
+    _alsa_dev.setperiodsize(256)  # ~16ms at 16kHz
 
     _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

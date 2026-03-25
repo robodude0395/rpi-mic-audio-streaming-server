@@ -123,7 +123,7 @@ Chrome (and most browsers) only allow microphone access on secure origins. When 
 To fix this, add the Pi's address to Chrome's insecure origins allowlist:
 
 1. Open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`
-2. Paste `http://<pi-ip>:8080` (e.g. `http://192.168.0.55:8080`)
+2. Paste `http://<pi-ip>:8080`
 3. Set the dropdown to **Enabled**
 4. Click **Relaunch**
 
