@@ -265,7 +265,7 @@ function mic(){
   navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false})
   .then(function(s){
     stream=s;ctx=new AudioContext();src=ctx.createMediaStreamSource(s);
-    proc=ctx.createScriptProcessor(128,1,1);
+    proc=ctx.createScriptProcessor(256,1,1);
     proc.onaudioprocess=function(e){
       if(!on||!ws||ws.readyState!==1)return;
       var pcm=f2i(ds(e.inputBuffer.getChannelData(0),ctx.sampleRate,R));
