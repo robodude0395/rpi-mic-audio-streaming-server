@@ -35,7 +35,7 @@ except KeyboardInterrupt:
 "
 ```
 
-Then open `https://<your-pi-ip>:8080` on your phone or laptop, accept the certificate warning, click Start, and speak into the mic. Audio plays through the Pi's speaker. Ctrl+C on the Pi to stop.
+Then open `http://<your-pi-ip>:8080` on your laptop, click Start, and speak into the mic. Audio plays through the Pi's speaker. Ctrl+C on the Pi to stop.
 
 ## Installation
 
@@ -118,11 +118,19 @@ The test page captures your browser's microphone via `getUserMedia`, encodes it 
 
 ### Browser Microphone Permission (HTTPS)
 
-Chrome and most browsers only allow microphone access on secure origins. The server automatically generates a self-signed TLS certificate on first run (stored in `.certs/`) and serves the page over HTTPS.
+Chrome and most browsers only allow microphone access on secure origins. Since the server uses plain HTTP for lowest latency (no TLS overhead on Pi Zero), you need to allowlist the Pi's address in Chrome:
 
-On first visit you'll see a browser security warning — click "Advanced" then "Proceed" (Chrome) or "Accept the Risk" (Firefox). After that, the mic permission prompt works normally. You only need to do this once per browser.
+1. Open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`
+2. Paste `http://<pi-ip>:8080` (e.g. `http://192.168.0.55:8080`)
+3. Set the dropdown to "Enabled"
+4. Click "Relaunch"
 
-**Important:** You also need to accept the certificate for the WebSocket port. After accepting the main page, open `https://<pi-ip>:4001` in a new tab, accept the warning there too, then go back to the main page and click Start.
+Or launch Chrome from the command line (macOS):
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --unsafely-treat-insecure-origin-as-secure="http://192.168.0.55:8080"
+```
 
 ## Configurable Parameters
 

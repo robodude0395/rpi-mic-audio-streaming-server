@@ -1,4 +1,4 @@
-"""Quick-start script: launches the audio server with the web test interface."""
+"""Quick-start: launches audio server with web test interface."""
 
 import logging
 import os
@@ -10,8 +10,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s
 audio_server.start(chunk_size=512)
 audio_server.start_web()
 
-print("Web test page running — open https://<pi-ip>:8080 in your browser")
-print("(Accept the self-signed certificate warning on first visit)")
+print("Open http://<pi-ip>:8080 in your browser")
+print("(Use Chrome flag for mic access — see README)")
 print("Press Ctrl+C to stop\n")
 
 try:
