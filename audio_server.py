@@ -137,32 +137,61 @@ _ws_server_obj = None
 
 
 def _ws_handler(websocket):
-    """Handle one WebSocket client — accumulate PCM, write full periods to ALSA.
+    """Handle one WebSocket client with separate receive and playback threads.
 
-    The browser sends small chunks (~170 bytes at 5ms intervals).
-    We accumulate until we have a full ALSA period (512 bytes = 256 samples)
-    then write once.  This matches the ALSA consumption rate exactly —
-    no frames dropped, no backlog.
+    Receiver: drains WebSocket as fast as possible, accumulates PCM into
+    a shared buffer, trims it to at most one ALSA period of data so
+    latency never grows.
+
+    Player: wakes when data is available, writes one period to ALSA,
+    blocks naturally at the hardware rate.
     """
     addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
-    period_bytes = 512  # 256 samples * 2 bytes per sample (16-bit)
-    pending = bytearray()
+
+    period_bytes = 512  # 256 samples * 2 bytes (16-bit mono)
+    lock = threading.Lock()
+    audio_buf = bytearray()
+    has_data = threading.Event()
+    done = threading.Event()
+
+    def _player():
+        while not done.is_set():
+            has_data.wait(timeout=0.1)
+            has_data.clear()
+            while True:
+                with lock:
+                    if len(audio_buf) < period_bytes:
+                        break
+                    chunk = bytes(audio_buf[:period_bytes])
+                    del audio_buf[:period_bytes]
+                if _alsa_dev is not None:
+                    try:
+                        _alsa_dev.write(chunk)
+                    except Exception:
+                        pass
+
+    player = threading.Thread(target=_player, daemon=True)
+    player.start()
+
     try:
         for message in websocket:
-            if not (isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None):
+            if not (isinstance(message, bytes) and len(message) > 0):
                 continue
-            pending.extend(message)
-            # Write full periods to ALSA, keep remainder for next round
-            while len(pending) >= period_bytes:
-                try:
-                    _alsa_dev.write(bytes(pending[:period_bytes]))
-                except Exception:
-                    pass
-                del pending[:period_bytes]
+            with lock:
+                audio_buf.extend(message)
+                # Keep at most 2 periods of data — drop oldest if more
+                max_bytes = period_bytes * 2
+                if len(audio_buf) > max_bytes:
+                    excess = len(audio_buf) - max_bytes
+                    del audio_buf[:excess]
+            has_data.set()
     except Exception as e:
-        _logger.error("WebSocket handler error from %s: %s", addr, e)
+        _logger.error("WebSocket error from %s: %s", addr, e)
     finally:
+        done.set()
+        has_data.set()
+        player.join(timeout=1.0)
         _logger.info("WebSocket client disconnected from %s", addr)
 
 
@@ -176,6 +205,7 @@ def _run_ws_server(host, port):
         compression=None,
         ping_interval=None,
         max_size=2**16,
+        max_queue=2,
     ) as server:
         _ws_server_obj = server
         _logger.info("WebSocket server on port %d", port)
