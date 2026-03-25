@@ -137,28 +137,29 @@ _ws_server_obj = None
 
 
 def _ws_handler(websocket):
-    """Handle one WebSocket client — read frames, write directly to ALSA.
+    """Handle one WebSocket client — accumulate PCM, write full periods to ALSA.
 
-    Drops frames when falling behind to prevent latency buildup.
+    The browser sends small chunks (~170 bytes at 5ms intervals).
+    We accumulate until we have a full ALSA period (512 bytes = 256 samples)
+    then write once.  This matches the ALSA consumption rate exactly —
+    no frames dropped, no backlog.
     """
     addr = websocket.remote_address
     _logger.info("WebSocket client connected from %s", addr)
-    last_write = 0.0
-    # Minimum interval between ALSA writes — matches period size.
-    # If frames arrive faster, we skip them to stay real-time.
-    min_interval = 0.012  # ~12ms
+    period_bytes = 512  # 256 samples * 2 bytes per sample (16-bit)
+    pending = bytearray()
     try:
         for message in websocket:
             if not (isinstance(message, bytes) and len(message) > 0 and _alsa_dev is not None):
                 continue
-            now = time.time()
-            if now - last_write < min_interval:
-                continue  # drop — ALSA is still busy with the last write
-            try:
-                _alsa_dev.write(message)
-                last_write = time.time()
-            except Exception:
-                _logger.exception("ALSA write error")
+            pending.extend(message)
+            # Write full periods to ALSA, keep remainder for next round
+            while len(pending) >= period_bytes:
+                try:
+                    _alsa_dev.write(bytes(pending[:period_bytes]))
+                except Exception:
+                    pass
+                del pending[:period_bytes]
     except Exception as e:
         _logger.error("WebSocket handler error from %s: %s", addr, e)
     finally:
