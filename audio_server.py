@@ -146,9 +146,9 @@ def _ws_handler(websocket):
                 try:
                     _alsa_dev.write(message)
                 except Exception:
-                    pass
-    except Exception:
-        pass
+                    _logger.exception("ALSA write error")
+    except Exception as e:
+        _logger.error("WebSocket handler error from %s: %s", addr, e)
     finally:
         _logger.info("WebSocket client disconnected from %s", addr)
 

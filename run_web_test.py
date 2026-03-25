@@ -5,7 +5,7 @@ import os
 import time
 import audio_server
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(name)s %(message)s")
 
 audio_server.start(chunk_size=512)
 audio_server.start_web()
